@@ -1,0 +1,24 @@
+# Kaggle Local Ultra 2 — preserve Kaggle CUDA/Torch unless your notebook image needs a compatible wheel.
+gradio>=5.0,<7
+numpy>=1.26
+scipy>=1.12
+librosa>=0.10.2
+soundfile>=0.12.1
+transformers>=4.51,<5.0
+sentencepiece>=0.2.0
+accelerate>=1.2.0
+safetensors>=0.5.0
+faster-whisper>=1.1.0
+whisperx>=3.7.4
+pyannote.audio>=4.0
+torchcodec>=0.7
+speechbrain>=1.0.3
+demucs>=4.0.1
+chatterbox-tts>=0.1.7
+funasr>=1.2
+pydub>=0.25.1
+huggingface_hub>=0.30
+PyYAML>=6.0
+# Optional/QA: all local, no inference API.
+gdown>=5.2
+syncnet-python @ git+https://github.com/colossyan/syncnet-python.git
