@@ -1,149 +1,124 @@
-```python
 """
 Anime Dub Studio Ultra 2
-Kaggle LOCAL model/cache preparation
+Kaggle LOCAL model/cache preparation — TEMP STORAGE build
 
-KAGGLE TEMP STORAGE BUILD
-
-IMPORTANT:
-- Run with Kaggle Internet enabled.
-- ALL heavy model downloads go to /kaggle/tmp by default.
-- /kaggle/working is NOT used for model storage.
-- Does NOT download every quantization/checkpoint in HF repositories.
-- Downloads only allowlisted model files.
-- Checks available scratch storage before each large download.
-- HF_TOKEN is required for gated pyannote models.
-
-STORAGE:
-
-Temporary / current session:
-    /kaggle/tmp/anime_dub_studio/models/
-
-Persistent output area:
-    /kaggle/working/
-    Only a small manifest is optionally written there.
-
-IMPORTANT:
-    /kaggle/tmp can be cleared when the Kaggle session ends.
-    For permanent reuse, package model folders as Kaggle Datasets
-    and mount them under /kaggle/input/.
+- Heavy models/cache -> /kaggle/tmp (fallback /kaggle/temp, then /tmp)
+- /kaggle/working -> small manifest only
+- Resumable Hugging Face downloads
+- Gated pyannote requires HF_TOKEN
+- Chatterbox entry is Multilingual V3
 """
 
 from pathlib import Path
-import os
-import sys
-import subprocess
-import shutil
 import json
+import os
+import shutil
+import subprocess
+import sys
 import time
+import tempfile
 
 
 # ============================================================
-# STORAGE CONFIGURATION
+# STORAGE
 # ============================================================
 
-# ------------------------------------------------------------
-# DEFAULT: EVERYTHING HEAVY GOES TO KAGGLE TEMP
-# ------------------------------------------------------------
+SCRATCH_PARENT = None
 
-DEFAULT_TMP_ROOT = "/kaggle/tmp/anime_dub_studio"
+for candidate in [Path("/kaggle/tmp"), Path("/kaggle/temp"), Path("/tmp")]:
+    try:
+        candidate.mkdir(parents=True, exist_ok=True)
+        probe = candidate / ".anime_dub_write_test"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink(missing_ok=True)
+        SCRATCH_PARENT = candidate
+        break
+    except Exception:
+        continue
+
+if SCRATCH_PARENT is None:
+    SCRATCH_PARENT = Path(tempfile.gettempdir())  # pragma: no cover
 
 SCRATCH_ROOT = Path(
     os.environ.get(
         "ANIME_DUB_SCRATCH",
-        DEFAULT_TMP_ROOT
+        str(SCRATCH_PARENT / "anime_dub_studio"),
     )
 )
 
-# Model root inside temporary storage
-ROOT = Path(
+MODEL_ROOT = Path(
     os.environ.get(
         "MODEL_CACHE",
-        str(SCRATCH_ROOT / "models")
+        str(SCRATCH_ROOT / "models"),
     )
 )
 
-# Optional tiny persistent manifest location
-PERSIST_MANIFEST_DIR = Path(
+PERSIST_ROOT = Path(
     os.environ.get(
         "MODEL_MANIFEST_DIR",
-        "/kaggle/working/anime_dub_studio"
+        "/kaggle/working/anime_dub_studio",
     )
 )
 
 SCRATCH_ROOT.mkdir(parents=True, exist_ok=True)
-ROOT.mkdir(parents=True, exist_ok=True)
-PERSIST_MANIFEST_DIR.mkdir(parents=True, exist_ok=True)
+MODEL_ROOT.mkdir(parents=True, exist_ok=True)
+PERSIST_ROOT.mkdir(parents=True, exist_ok=True)
 
 
 # ============================================================
-# HUGGING FACE CACHE
+# CACHE ENVIRONMENT
 # ============================================================
 
-HF_HOME = ROOT / "hf"
-HF_HUB_CACHE = ROOT / "hub"
-TRANSFORMERS_CACHE = ROOT / "transformers"
-HF_DATASETS_CACHE = ROOT / "datasets"
+HF_HOME = MODEL_ROOT / "hf"
+HF_HUB_CACHE = MODEL_ROOT / "hub"
+TRANSFORMERS_CACHE = MODEL_ROOT / "transformers"
+HF_DATASETS_CACHE = MODEL_ROOT / "datasets"
+TORCH_HOME = MODEL_ROOT / "torch"
+XDG_CACHE_HOME = MODEL_ROOT / "xdg"
+TMP_ROOT = SCRATCH_ROOT / "tmp"
 
-HF_HOME.mkdir(parents=True, exist_ok=True)
-HF_HUB_CACHE.mkdir(parents=True, exist_ok=True)
-TRANSFORMERS_CACHE.mkdir(parents=True, exist_ok=True)
-HF_DATASETS_CACHE.mkdir(parents=True, exist_ok=True)
+for p in [
+    HF_HOME,
+    HF_HUB_CACHE,
+    TRANSFORMERS_CACHE,
+    HF_DATASETS_CACHE,
+    TORCH_HOME,
+    XDG_CACHE_HOME,
+    TMP_ROOT,
+]:
+    p.mkdir(parents=True, exist_ok=True)
 
-
-# Force HF/Transformers caches into /kaggle/tmp
 for key, value in {
     "HF_HOME": HF_HOME,
     "HF_HUB_CACHE": HF_HUB_CACHE,
     "HUGGINGFACE_HUB_CACHE": HF_HUB_CACHE,
     "TRANSFORMERS_CACHE": TRANSFORMERS_CACHE,
     "HF_DATASETS_CACHE": HF_DATASETS_CACHE,
-    "TORCH_HOME": ROOT / "torch",
-    "XDG_CACHE_HOME": ROOT / "xdg",
+    "TORCH_HOME": TORCH_HOME,
+    "XDG_CACHE_HOME": XDG_CACHE_HOME,
+    "TMPDIR": TMP_ROOT,
+    "TEMP": TMP_ROOT,
+    "TMP": TMP_ROOT,
+    "GRADIO_TEMP_DIR": TMP_ROOT,
 }.items():
     os.environ[key] = str(value)
 
-# Prevent Hugging Face from writing surprise caches elsewhere.
-os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
-
-# Kaggle temp for Python temporary files
-TMP_DIR = SCRATCH_ROOT / "tmp"
-TMP_DIR.mkdir(parents=True, exist_ok=True)
-
-os.environ["TMPDIR"] = str(TMP_DIR)
-os.environ["TEMP"] = str(TMP_DIR)
-os.environ["TMP"] = str(TMP_DIR)
-
-# Make tempfile use Kaggle scratch too.
 try:
     import tempfile
-    tempfile.tempdir = str(TMP_DIR)
+    tempfile.tempdir = str(TMP_ROOT)
 except Exception:
     pass
 
-
-# ============================================================
-# HF TOKEN
-# ============================================================
-
-HF_TOKEN = (
-    os.environ.get("HF_TOKEN", "").strip()
-    or None
-)
+HF_TOKEN = os.environ.get("HF_TOKEN", "").strip() or None
 
 
 # ============================================================
-# MODEL CONFIGURATION
+# MODELS
 # ============================================================
 
 MODELS = {
-
-    # --------------------------------------------------------
-    # Translation
-    # --------------------------------------------------------
     "translation": {
         "repo": "google/madlad400-3b-mt",
-
         "patterns": [
             "config.json",
             "generation_config.json",
@@ -154,26 +129,20 @@ MODELS = {
             "special_tokens_map.json",
             "added_tokens.json",
         ],
-
         "required_space_gb": 13.0,
         "optional": True,
+        "description": "MADLAD-400 3B translation",
     },
 
-    # --------------------------------------------------------
-    # Dialogue Director
-    # --------------------------------------------------------
     "dialogue_director": {
         "repo": "Qwen/Qwen3-4B",
-
         "patterns": [
             "config.json",
             "generation_config.json",
             "model.safetensors.index.json",
-
             "model-00001-of-00003.safetensors",
             "model-00002-of-00003.safetensors",
             "model-00003-of-00003.safetensors",
-
             "tokenizer.json",
             "tokenizer_config.json",
             "merges.txt",
@@ -181,17 +150,13 @@ MODELS = {
             "chat_template.json",
             "special_tokens_map.json",
         ],
-
         "required_space_gb": 9.0,
         "optional": True,
+        "description": "Qwen3 4B dialogue director",
     },
 
-    # --------------------------------------------------------
-    # Speaker Encoder
-    # --------------------------------------------------------
     "speaker_encoder": {
         "repo": "speechbrain/spkrec-ecapa-voxceleb",
-
         "patterns": [
             "*.ckpt",
             "*.yaml",
@@ -199,17 +164,13 @@ MODELS = {
             "*.json",
             "*.md",
         ],
-
-        "required_space_gb": 0.15,
+        "required_space_gb": 0.25,
         "optional": False,
+        "description": "ECAPA speaker encoder",
     },
 
-    # --------------------------------------------------------
-    # PyAnnote Community-1
-    # --------------------------------------------------------
     "pyannote": {
         "repo": "pyannote/speaker-diarization-community-1",
-
         "patterns": [
             "*.yaml",
             "*.yml",
@@ -219,18 +180,14 @@ MODELS = {
             "*.ckpt",
             "*.txt",
         ],
-
-        "required_space_gb": 0.8,
+        "required_space_gb": 1.0,
         "optional": False,
         "gated": True,
+        "description": "pyannote Community-1 diarization",
     },
 
-    # --------------------------------------------------------
-    # SenseVoice
-    # --------------------------------------------------------
     "sensevoice": {
         "repo": "FunAudioLLM/SenseVoiceSmall",
-
         "patterns": [
             "model.pt",
             "config.yaml",
@@ -239,212 +196,143 @@ MODELS = {
             "am.mvn",
             "README.md",
         ],
-
         "required_space_gb": 1.0,
         "optional": True,
+        "description": "SenseVoiceSmall emotion/event model",
     },
 
-    # --------------------------------------------------------
-    # Chatterbox
-    # --------------------------------------------------------
+    # Current Chatterbox Multilingual V3 T3 checkpoint.
     "chatterbox": {
         "repo": "ResembleAI/chatterbox",
-
         "patterns": [
             "ve.safetensors",
-            "t3_cfg.safetensors",
+            "t3_mtl23ls_v3.safetensors",
             "s3gen.safetensors",
             "tokenizer.json",
             "conds.pt",
         ],
-
-        "required_space_gb": 3.5,
+        "required_space_gb": 4.5,
         "optional": True,
+        "description": "Chatterbox Multilingual V3",
     },
 }
 
 
 # ============================================================
-# UTILITY
+# UTILITIES
 # ============================================================
 
 def run(cmd, cwd=None, quiet=False):
-    """Run shell command with useful logging."""
-
-    print(
-        "$ " +
-        " ".join(
-            str(x) for x in cmd
-        )
-    )
-
+    print("$", " ".join(str(x) for x in cmd), flush=True)
     return subprocess.run(
-        cmd,
-        cwd=cwd,
+        [str(x) for x in cmd],
+        cwd=str(cwd) if cwd else None,
         check=True,
         stdout=subprocess.DEVNULL if quiet else None,
         stderr=None,
     )
 
 
-def disk_usage(path):
-    return shutil.disk_usage(str(path))
+def disk_info(path):
+    u = shutil.disk_usage(str(path))
+    return {
+        "total_gb": u.total / (1024 ** 3),
+        "used_gb": u.used / (1024 ** 3),
+        "free_gb": u.free / (1024 ** 3),
+    }
 
 
 def free_gb(path=None):
-    """
-    Calculate free storage for the actual scratch filesystem.
-
-    By default checks SCRATCH_ROOT rather than /kaggle/working.
-    """
-
-    path = path or SCRATCH_ROOT
-
+    target = path or SCRATCH_ROOT
     try:
-        usage = disk_usage(path)
-        return usage.free / (1024 ** 3)
+        return disk_info(target)["free_gb"]
     except Exception:
-
-        # Fallback
-        usage = disk_usage("/kaggle/tmp")
-        return usage.free / (1024 ** 3)
-
-
-def used_gb(path=None):
-    path = path or SCRATCH_ROOT
-
-    try:
-        usage = disk_usage(path)
-
-        return {
-            "total": usage.total / (1024 ** 3),
-            "used": usage.used / (1024 ** 3),
-            "free": usage.free / (1024 ** 3),
-        }
-
-    except Exception:
-
-        usage = disk_usage("/kaggle/tmp")
-
-        return {
-            "total": usage.total / (1024 ** 3),
-            "used": usage.used / (1024 ** 3),
-            "free": usage.free / (1024 ** 3),
-        }
+        for p in [Path("/kaggle/tmp"), Path("/kaggle/temp"), Path("/tmp")]:
+            try:
+                return disk_info(p)["free_gb"]
+            except Exception:
+                pass
+    return 0.0
 
 
 def folder_size_gb(path):
-    """
-    Calculate actual folder size recursively.
-    """
-
     path = Path(path)
-
     if not path.exists():
         return 0.0
 
     total = 0
-
     try:
-
         for p in path.rglob("*"):
-
             if p.is_file():
-
                 try:
                     total += p.stat().st_size
                 except Exception:
                     pass
-
     except Exception:
         pass
 
     return total / (1024 ** 3)
 
 
-def print_disk():
-
-    scratch = used_gb(SCRATCH_ROOT)
-    working = used_gb("/kaggle/working")
-
-    print()
-    print("=" * 70)
-    print("KAGGLE STORAGE")
-    print("=" * 70)
-
-    print()
-    print("TEMP / SCRATCH")
-    print(f"Path  : {SCRATCH_ROOT}")
-    print(f"Total : {scratch['total']:.2f} GB")
-    print(f"Used  : {scratch['used']:.2f} GB")
-    print(f"Free  : {scratch['free']:.2f} GB")
-
-    print()
-    print("WORKING")
-    print("Path  : /kaggle/working")
-    print(f"Total : {working['total']:.2f} GB")
-    print(f"Used  : {working['used']:.2f} GB")
-    print(f"Free  : {working['free']:.2f} GB")
-
-    print()
-    print("=" * 70)
-    print()
-
-
-def safe_model_dir(name):
-
-    path = ROOT / name
-
-    path.mkdir(
-        parents=True,
-        exist_ok=True
-    )
-
-    return path
-
-
-def path_exists_nonempty(path):
-
-    path = Path(path)
-
-    if not path.exists():
-        return False
-
+def has_files(path):
     try:
-        return any(path.iterdir())
+        return Path(path).exists() and any(Path(path).iterdir())
     except Exception:
         return False
 
 
+def print_storage():
+    print()
+    print("=" * 72)
+    print("KAGGLE STORAGE")
+    print("=" * 72)
+
+    for label, path in [
+        ("SCRATCH", SCRATCH_ROOT),
+        ("MODELS", MODEL_ROOT),
+        ("WORKING", Path("/kaggle/working")),
+    ]:
+        try:
+            info = disk_info(path)
+            print(
+                f"{label:9s} "
+                f"{str(path):48s} "
+                f"free={info['free_gb']:.2f} GB "
+                f"used={info['used_gb']:.2f} GB"
+            )
+        except Exception as e:
+            print(f"{label:9s} {e}")
+
+    print("=" * 72)
+
+
+def show_model_sizes():
+    print()
+    print("=" * 72)
+    print("MODEL FOLDER SIZES")
+    print("=" * 72)
+
+    if not MODEL_ROOT.exists():
+        print("No model cache yet.")
+        return
+
+    for p in sorted(MODEL_ROOT.iterdir()):
+        if p.is_dir():
+            print(f"{p.name:32s} {folder_size_gb(p):8.2f} GB")
+
+
 # ============================================================
-# REQUIREMENTS
+# DEPENDENCIES
 # ============================================================
 
 def ensure_huggingface_hub():
-
     try:
-
         import huggingface_hub
-
-        print(
-            "huggingface_hub:",
-            huggingface_hub.__version__
-        )
-
+        print("huggingface_hub:", huggingface_hub.__version__)
         return True
-
     except Exception:
-
-        print(
-            "huggingface_hub not found."
-        )
-
-        print(
-            "Installing compatible version..."
-        )
-
+        print("huggingface_hub missing; installing...")
         try:
-
             run([
                 sys.executable,
                 "-m",
@@ -453,186 +341,105 @@ def ensure_huggingface_hub():
                 "-q",
                 "huggingface_hub>=0.30",
             ])
-
             return True
-
         except Exception as e:
+            print("huggingface_hub installation failed:", e)
+            return False
 
-            print(
-                "huggingface_hub installation failed:"
-            )
 
-            print(e)
-
+def ensure_gdown():
+    try:
+        import gdown  # noqa
+        return True
+    except Exception:
+        print("gdown missing; installing...")
+        try:
+            run([
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "-q",
+                "gdown",
+            ])
+            return True
+        except Exception as e:
+            print("gdown installation failed:", e)
             return False
 
 
 # ============================================================
-# HUGGING FACE DOWNLOAD
+# HUGGING FACE
 # ============================================================
 
 def hf_download_model(name, cfg):
-
     try:
-
         from huggingface_hub import snapshot_download
-
     except Exception:
-
-        print(
-            f"[{name}] huggingface_hub unavailable."
-        )
-
+        print(f"[{name}] huggingface_hub unavailable.")
         return False
 
+    target = MODEL_ROOT / name
+    target.mkdir(parents=True, exist_ok=True)
 
-    repo = cfg["repo"]
-    patterns = cfg["patterns"]
-
-    target = safe_model_dir(name)
-
-    required = float(
-        cfg.get(
-            "required_space_gb",
-            0
-        )
-    )
-
-    available = free_gb()
-
-    print()
-    print("=" * 70)
-    print(f"[{name}]")
-    print("=" * 70)
-
-    print(f"Repo           : {repo}")
-    print(f"Target         : {target}")
-    print(f"Required ~     : {required:.2f} GB")
-    print(f"Scratch free   : {available:.2f} GB")
-    print(f"Persistent     : /kaggle/working")
-    print(f"Heavy storage  : /kaggle/tmp")
-    print()
-
-    # --------------------------------------------------------
-    # TOKEN CHECK FOR GATED MODEL
-    # --------------------------------------------------------
-
-    if cfg.get("gated"):
-
-        if not HF_TOKEN:
-
-            print(
-                "SKIP: HF_TOKEN is not configured."
-            )
-
-            print(
-                "Accept the gated pyannote model terms "
-                "and set HF_TOKEN before running again."
-            )
-
-            return False
-
-
-    # --------------------------------------------------------
-    # DISK CHECK
-    # --------------------------------------------------------
-
+    required = float(cfg.get("required_space_gb", 0))
+    available = free_gb(SCRATCH_ROOT)
     safety_margin = 0.50
 
-    if available < required + safety_margin:
+    print()
+    print("=" * 72)
+    print(f"[{name}] {cfg.get('description', '')}")
+    print("=" * 72)
+    print("Repo         :", cfg["repo"])
+    print("Target       :", target)
+    print(f"Need approx  : {required:.2f} GB")
+    print(f"Scratch free : {available:.2f} GB")
 
-        print(
-            "SKIP: insufficient temporary storage."
-        )
-
-        print(
-            f"Need approximately "
-            f"{required + safety_margin:.2f} GB "
-            f"including safety margin."
-        )
-
-        print(
-            f"Available: {available:.2f} GB"
-        )
-
+    if cfg.get("gated") and not HF_TOKEN:
+        print("SKIP: HF_TOKEN is not configured.")
         return False
 
-
-    # --------------------------------------------------------
-    # SHOW EXISTING FILES
-    # --------------------------------------------------------
-
-    if path_exists_nonempty(target):
-
+    if available < required + safety_margin:
+        print("SKIP: insufficient scratch storage.")
         print(
-            "Existing target directory detected."
+            f"Need with safety margin: "
+            f"{required + safety_margin:.2f} GB"
         )
+        return False
 
-        size = folder_size_gb(target)
-
+    if has_files(target):
         print(
-            f"Existing size: {size:.2f} GB"
+            f"Existing target size: "
+            f"{folder_size_gb(target):.2f} GB"
         )
-
-        print(
-            "HF download will reuse/resume existing files."
-        )
-
-
-    # --------------------------------------------------------
-    # DOWNLOAD
-    # --------------------------------------------------------
+        print("Hugging Face will reuse/resume existing files.")
 
     kwargs = {
-        "repo_id": repo,
+        "repo_id": cfg["repo"],
         "local_dir": str(target),
-        "allow_patterns": patterns,
+        "allow_patterns": cfg["patterns"],
     }
 
-
-    if HF_TOKEN and cfg.get("gated"):
-
+    if cfg.get("gated"):
         kwargs["token"] = HF_TOKEN
 
-
     try:
+        started = time.time()
 
-        start = time.time()
+        snapshot_download(**kwargs)
 
-        snapshot_download(
-            **kwargs
-        )
-
-        elapsed = time.time() - start
-
-        size = folder_size_gb(target)
+        elapsed = time.time() - started
+        final_size = folder_size_gb(target)
 
         print()
-        print(
-            f"[{name}] DOWNLOAD OK"
-        )
-
-        print(
-            f"Final folder size: {size:.2f} GB"
-        )
-
-        print(
-            f"Time: {elapsed / 60:.1f} min"
-        )
-
+        print(f"[{name}] DOWNLOAD OK")
+        print(f"Final size : {final_size:.2f} GB")
+        print(f"Elapsed    : {elapsed / 60:.1f} min")
         return True
 
     except Exception as e:
-
-        print()
-        print(
-            f"[{name}] DOWNLOAD FAILED"
-        )
-
-        print(
-            str(e)[:2000]
-        )
-
+        print(f"[{name}] DOWNLOAD FAILED")
+        print(str(e)[:3000])
         return False
 
 
@@ -641,49 +448,31 @@ def hf_download_model(name, cfg):
 # ============================================================
 
 def verify_chatterbox():
-
-    path = ROOT / "chatterbox"
+    root = MODEL_ROOT / "chatterbox"
 
     required = [
         "ve.safetensors",
-        "t3_cfg.safetensors",
+        "t3_mtl23ls_v3.safetensors",
         "s3gen.safetensors",
         "tokenizer.json",
         "conds.pt",
     ]
 
     print()
-    print("=" * 70)
-    print("CHATTERBOX FILE CHECK")
-    print("=" * 70)
+    print("=" * 72)
+    print("CHATTERBOX MULTILINGUAL V3 CHECK")
+    print("=" * 72)
 
     ok = True
 
     for filename in required:
-
-        p = path / filename
-
+        p = root / filename
         if p.exists():
-
-            size_mb = (
-                p.stat().st_size /
-                (1024 ** 2)
-            )
-
-            print(
-                f"OK    {filename:35s} "
-                f"{size_mb:,.1f} MB"
-            )
-
+            size_mb = p.stat().st_size / (1024 ** 2)
+            print(f"OK   {filename:40s} {size_mb:,.1f} MB")
         else:
-
-            print(
-                f"MISS  {filename}"
-            )
-
+            print(f"MISS {filename}")
             ok = False
-
-    print()
 
     return ok
 
@@ -692,57 +481,26 @@ def verify_chatterbox():
 # WAV2LIP
 # ============================================================
 
-def wav2lip():
-
-    repo_dir = ROOT / "Wav2Lip"
+def install_wav2lip():
+    repo_dir = MODEL_ROOT / "Wav2Lip"
     ckpt_dir = repo_dir / "checkpoints"
-
     gan = ckpt_dir / "wav2lip_gan.pth"
 
     print()
-    print("=" * 70)
+    print("=" * 72)
     print("WAV2LIP")
-    print("=" * 70)
+    print("=" * 72)
 
-    print(
-        "Repository:",
-        repo_dir
-    )
-
-    if gan.exists():
-
-        print(
-            "Wav2Lip checkpoint already exists."
-        )
-
+    if gan.exists() and gan.stat().st_size > 100_000_000:
+        print("Wav2Lip checkpoint already exists.")
         return True
 
-
-    required = 1.5
-
-    available = free_gb()
-
-    if available < required + 0.25:
-
-        print(
-            "SKIP: not enough scratch storage for Wav2Lip."
-        )
-
+    if free_gb(SCRATCH_ROOT) < 2.0:
+        print("SKIP: not enough scratch storage.")
         return False
 
-
-    # --------------------------------------------------------
-    # Clone repo into /kaggle/tmp
-    # --------------------------------------------------------
-
     if not repo_dir.exists():
-
-        print(
-            "Cloning Wav2Lip into temporary storage..."
-        )
-
         try:
-
             run([
                 "git",
                 "clone",
@@ -751,34 +509,18 @@ def wav2lip():
                 "https://github.com/Rudrabha/Wav2Lip.git",
                 str(repo_dir),
             ])
-
         except Exception as e:
-
-            print(
-                "Wav2Lip clone failed:"
-            )
-
-            print(e)
-
+            print("Wav2Lip clone failed:", e)
             return False
 
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-    ckpt_dir.mkdir(
-        parents=True,
-        exist_ok=True
-    )
+    if not ensure_gdown():
+        return False
 
-
-    # --------------------------------------------------------
-    # Download checkpoint
-    # --------------------------------------------------------
-
-    file_id = (
-        "15G3U08c8xsCkOqQxE38Z2XXDnPcOptNk"
-    )
+    file_id = "15G3U08c8xsCkOqQxE38Z2XXDnPcOptNk"
 
     try:
-
         run([
             sys.executable,
             "-m",
@@ -790,27 +532,14 @@ def wav2lip():
         ])
 
         if gan.exists() and gan.stat().st_size > 100_000_000:
-
-            print(
-                "Wav2Lip checkpoint OK"
-            )
-
+            print("Wav2Lip checkpoint OK.")
             return True
 
-        print(
-            "Wav2Lip checkpoint file looks invalid."
-        )
-
+        print("Wav2Lip checkpoint appears incomplete.")
         return False
 
     except Exception as e:
-
-        print(
-            "Wav2Lip checkpoint download failed:"
-        )
-
-        print(e)
-
+        print("Wav2Lip checkpoint download failed:", e)
         return False
 
 
@@ -818,59 +547,29 @@ def wav2lip():
 # SYNCNET
 # ============================================================
 
-def syncnet():
-
-    repo_dir = ROOT / "syncnet-python"
-
-    print()
-    print("=" * 70)
-    print("SYNCNET")
-    print("=" * 70)
-
-    print(
-        "Repository:",
-        repo_dir
-    )
-
-
-    # --------------------------------------------------------
-    # Stable model location
-    # --------------------------------------------------------
-
-    stable_dir = ROOT / "syncnet"
+def install_syncnet():
+    repo_dir = MODEL_ROOT / "syncnet-python"
+    stable_dir = MODEL_ROOT / "syncnet"
     stable = stable_dir / "syncnet_v2.model"
 
-    stable_dir.mkdir(
-        parents=True,
-        exist_ok=True
-    )
+    print()
+    print("=" * 72)
+    print("SYNCNET")
+    print("=" * 72)
 
+    stable_dir.mkdir(parents=True, exist_ok=True)
 
-    if stable.exists():
+    if stable.exists() and stable.stat().st_size > 10_000_000:
+        print("SyncNet weights already exist.")
+        print(stable)
+        return True
 
-        size_mb = (
-            stable.stat().st_size /
-            (1024 ** 2)
-        )
-
-        if stable.stat().st_size > 10_000_000:
-
-            print(
-                f"SyncNet stable weights already exist "
-                f"({size_mb:.1f} MB)."
-            )
-
-            return True
-
-
-    # --------------------------------------------------------
-    # Clone repository
-    # --------------------------------------------------------
+    if free_gb(SCRATCH_ROOT) < 1.0:
+        print("SKIP: not enough scratch storage.")
+        return False
 
     if not repo_dir.exists():
-
         try:
-
             run([
                 "git",
                 "clone",
@@ -879,198 +578,46 @@ def syncnet():
                 "https://github.com/colossyan/syncnet-python.git",
                 str(repo_dir),
             ])
-
         except Exception as e:
-
-            print(
-                "SyncNet clone failed:"
-            )
-
-            print(e)
-
+            print("SyncNet clone failed:", e)
             return False
-
-
-    # --------------------------------------------------------
-    # Download model
-    # --------------------------------------------------------
 
     script = repo_dir / "download_model.sh"
 
     if script.exists():
-
         try:
-
             run(
-                [
-                    "bash",
-                    str(script)
-                ],
-                cwd=str(repo_dir)
+                ["bash", str(script)],
+                cwd=repo_dir,
             )
-
         except Exception as e:
-
-            print(
-                "SyncNet download script failed:"
-            )
-
-            print(e)
-
-
-    # --------------------------------------------------------
-    # Locate downloaded model
-    # --------------------------------------------------------
+            print("SyncNet download script failed:", e)
 
     candidates = []
-
     try:
-
-        candidates += list(
-            repo_dir.rglob("*.model")
-        )
-
-        candidates += list(
-            repo_dir.rglob("*.pth")
-        )
-
+        candidates.extend(repo_dir.rglob("*.model"))
+        candidates.extend(repo_dir.rglob("*.pth"))
     except Exception:
         pass
 
-
     candidates = sorted(
         candidates,
-        key=lambda p: p.stat().st_size
-        if p.exists()
-        else 0,
+        key=lambda p: p.stat().st_size if p.exists() else 0,
         reverse=True,
     )
 
-
     for src in candidates:
-
         try:
-
-            if (
-                src.exists()
-                and src.stat().st_size > 10_000_000
-                and (
-                    "syncnet"
-                    in src.name.lower()
-                    or src.suffix.lower()
-                    in {".model", ".pth"}
-                )
-            ):
-
-                shutil.copy2(
-                    src,
-                    stable
-                )
-
-                print()
-                print(
-                    "SyncNet stable weights:"
-                )
-
-                print(
-                    stable
-                )
-
-                print(
-                    f"Size: "
-                    f"{stable.stat().st_size / (1024**2):.1f} MB"
-                )
-
+            if src.exists() and src.stat().st_size > 10_000_000:
+                shutil.copy2(src, stable)
+                print("SyncNet weights copied:")
+                print(stable)
                 return True
-
         except Exception as e:
+            print("SyncNet copy failed:", e)
 
-            print(
-                "SyncNet copy failed:"
-            )
-
-            print(e)
-
-
-    print(
-        "SyncNet model weights not found."
-    )
-
+    print("SyncNet model weights not found.")
     return False
-
-
-# ============================================================
-# INCOMPLETE / TEMP CACHE CLEANUP
-# ============================================================
-
-def show_cache_sizes():
-
-    print()
-    print("=" * 70)
-    print("SCRATCH CACHE SIZES")
-    print("=" * 70)
-
-    try:
-
-        for child in sorted(
-            ROOT.iterdir()
-        ):
-
-            if child.is_dir():
-
-                size = folder_size_gb(
-                    child
-                )
-
-                print(
-                    f"{child.name:35s} "
-                    f"{size:8.2f} GB"
-                )
-
-    except Exception as e:
-
-        print(
-            "Cache size scan failed:",
-            e
-        )
-
-
-def clean_failed_partial_directory(name):
-
-    """
-    Optional manual helper.
-
-    It does NOT automatically delete anything because
-    partially downloaded files can sometimes be resumed.
-    """
-
-    path = ROOT / name
-
-    if not path.exists():
-
-        print(
-            f"No cache found for {name}"
-        )
-
-        return
-
-
-    print()
-    print(
-        f"{name} cache exists at:"
-    )
-
-    print(
-        path
-    )
-
-    print(
-        "No automatic deletion performed."
-    )
-
-    print(
-        "This allows Hugging Face resume behavior."
-    )
 
 
 # ============================================================
@@ -1078,102 +625,41 @@ def clean_failed_partial_directory(name):
 # ============================================================
 
 def write_manifest(results):
-
-    data = used_gb(
-        SCRATCH_ROOT
-    )
+    scratch = disk_info(SCRATCH_ROOT)
 
     manifest = {
-
-        "app":
-            "Anime Dub Studio Ultra 2",
-
-        "created":
-            time.strftime(
-                "%Y-%m-%dT%H:%M:%SZ",
-                time.gmtime()
-            ),
-
-        "scratch_root":
-            str(SCRATCH_ROOT),
-
-        "model_root":
-            str(ROOT),
-
+        "app": "Anime Dub Studio Ultra 2",
+        "created_utc": time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ",
+            time.gmtime(),
+        ),
+        "scratch_root": str(SCRATCH_ROOT),
+        "model_root": str(MODEL_ROOT),
+        "persistent_manifest_dir": str(PERSIST_ROOT),
         "scratch_storage": {
-            "total_gb":
-                round(data["total"], 2),
-
-            "used_gb":
-                round(data["used"], 2),
-
-            "free_gb":
-                round(data["free"], 2),
+            "total_gb": round(scratch["total_gb"], 2),
+            "used_gb": round(scratch["used_gb"], 2),
+            "free_gb": round(scratch["free_gb"], 2),
         },
-
-        "models":
-            results,
+        "models": results,
     }
 
-
-    # --------------------------------------------------------
-    # Persistent copy of only the small manifest
-    # --------------------------------------------------------
-
-    persistent_path = (
-        PERSIST_MANIFEST_DIR /
-        "model_manifest.json"
+    payload = json.dumps(
+        manifest,
+        indent=2,
+        ensure_ascii=False,
     )
 
+    temp_manifest = MODEL_ROOT / "model_manifest.json"
+    persistent_manifest = PERSIST_ROOT / "model_manifest.json"
 
-    try:
+    temp_manifest.write_text(payload, encoding="utf-8")
+    persistent_manifest.write_text(payload, encoding="utf-8")
 
-        persistent_path.write_text(
-            json.dumps(
-                manifest,
-                indent=2,
-                ensure_ascii=False
-            ),
-            encoding="utf-8"
-        )
-
-        print()
-        print(
-            "Persistent manifest:"
-        )
-
-        print(
-            persistent_path
-        )
-
-    except Exception as e:
-
-        print(
-            "Persistent manifest write failed:"
-        )
-
-        print(e)
-
-
-    # Also keep a copy next to the model cache
-    try:
-
-        temp_manifest = (
-            ROOT /
-            "model_manifest.json"
-        )
-
-        temp_manifest.write_text(
-            json.dumps(
-                manifest,
-                indent=2,
-                ensure_ascii=False
-            ),
-            encoding="utf-8"
-        )
-
-    except Exception:
-        pass
+    print()
+    print("Manifest saved:")
+    print("Temporary :", temp_manifest)
+    print("Persistent:", persistent_manifest)
 
 
 # ============================================================
@@ -1181,245 +667,85 @@ def write_manifest(results):
 # ============================================================
 
 def main():
-
     print()
-    print("=" * 70)
+    print("=" * 72)
     print("ANIME DUB STUDIO ULTRA 2")
     print("KAGGLE LOCAL MODEL PREPARATION")
     print("TEMP STORAGE BUILD")
-    print("=" * 70)
+    print("=" * 72)
 
     print()
-    print(
-        "Scratch root:"
-    )
-
-    print(
-        SCRATCH_ROOT
-    )
-
+    print("Scratch root:", SCRATCH_ROOT)
+    print("Model root  :", MODEL_ROOT)
+    print("Persistent  :", PERSIST_ROOT)
     print()
-    print(
-        "Model root:"
-    )
-
-    print(
-        ROOT
-    )
-
+    print("Heavy model/cache storage -> scratch")
+    print("Persistent output        -> /kaggle/working")
     print()
-    print(
-        "Heavy model/cache storage:"
-    )
 
-    print(
-        "✅ /kaggle/tmp"
-    )
-
-    print()
-    print(
-        "Persistent output:"
-    )
-
-    print(
-        "✅ /kaggle/working "
-        "(manifest only)"
-    )
-
-
-    # --------------------------------------------------------
-    # Ensure directories
-    # --------------------------------------------------------
-
-    SCRATCH_ROOT.mkdir(
-        parents=True,
-        exist_ok=True
-    )
-
-    ROOT.mkdir(
-        parents=True,
-        exist_ok=True
-    )
-
-
-    # --------------------------------------------------------
-    # Initial disk report
-    # --------------------------------------------------------
-
-    print_disk()
-
-    show_cache_sizes()
-
-
-    # --------------------------------------------------------
-    # Hugging Face dependency
-    # --------------------------------------------------------
+    print_storage()
+    show_model_sizes()
 
     if not ensure_huggingface_hub():
-
-        print(
-            "Cannot continue without huggingface_hub."
-        )
-
-        return
-
+        return 1
 
     results = {}
 
-
-    # --------------------------------------------------------
-    # Download HF models
-    # --------------------------------------------------------
-
+    # HF models
     for name, cfg in MODELS.items():
-
-        print()
-
-        status = hf_download_model(
-            name,
-            cfg
-        )
-
         results[name] = bool(
-            status
+            hf_download_model(name, cfg)
         )
+        print_storage()
 
-        print_disk()
-
-
-    # --------------------------------------------------------
-    # Chatterbox verification
-    # --------------------------------------------------------
-
-    chatterbox_dir = (
-        ROOT /
-        "chatterbox"
-    )
-
-    if chatterbox_dir.exists():
-
-        results[
-            "chatterbox_verify"
-        ] = bool(
+    # Verify Chatterbox
+    if (MODEL_ROOT / "chatterbox").exists():
+        results["chatterbox_verify"] = bool(
             verify_chatterbox()
         )
 
-
-    # --------------------------------------------------------
     # Wav2Lip
-    # --------------------------------------------------------
-
-    results[
-        "wav2lip"
-    ] = bool(
-        wav2lip()
+    results["wav2lip"] = bool(
+        install_wav2lip()
     )
+    print_storage()
 
-    print_disk()
-
-
-    # --------------------------------------------------------
     # SyncNet
-    # --------------------------------------------------------
-
-    results[
-        "syncnet"
-    ] = bool(
-        syncnet()
+    results["syncnet"] = bool(
+        install_syncnet()
     )
+    print_storage()
 
-    print_disk()
-
-
-    # --------------------------------------------------------
-    # Final cache report
-    # --------------------------------------------------------
-
-    show_cache_sizes()
-
-
-    # --------------------------------------------------------
-    # Manifest
-    # --------------------------------------------------------
-
-    write_manifest(
-        results
-    )
-
-
-    # --------------------------------------------------------
-    # Final status
-    # --------------------------------------------------------
+    # Final report
+    show_model_sizes()
+    write_manifest(results)
 
     print()
-    print("=" * 70)
+    print("=" * 72)
     print("PREPARATION FINISHED")
-    print("=" * 70)
-
-    print()
-    print(
-        "Results:"
-    )
+    print("=" * 72)
 
     for name, status in results.items():
-
-        label = (
-            "OK"
-            if status
-            else
-            "SKIP/FAIL"
-        )
-
         print(
-            f"  {label:10s} {name}"
+            f"  {'OK' if status else 'SKIP/FAIL':10s} {name}"
         )
 
-
     print()
-
-    print(
-        "Temporary model root:"
-    )
-
-    print(
-        ROOT
-    )
-
+    print("Model cache:")
+    print(MODEL_ROOT)
     print()
-
     print(
-        "IMPORTANT:"
+        "NOTE: scratch storage is not guaranteed to survive "
+        "a new Kaggle session."
+    )
+    print(
+        "For permanent reuse, package model folders as Kaggle "
+        "Dataset(s) and mount them under /kaggle/input/."
     )
 
-    print(
-        "Large models are intentionally stored under "
-        "/kaggle/tmp instead of /kaggle/working."
-    )
+    print_storage()
+    return 0
 
-    print()
-
-    print(
-        "Because /kaggle/tmp is session scratch storage, "
-        "models may disappear after the Kaggle session ends."
-    )
-
-    print()
-
-    print(
-        "For persistent reuse, package the completed model "
-        "directory as a Kaggle Dataset and mount it under "
-        "/kaggle/input/."
-    )
-
-    print()
-
-    print_disk()
-
-
-# ============================================================
-# ENTRY POINT
-# ============================================================
 
 if __name__ == "__main__":
-    main()
-```
+    raise SystemExit(main())
