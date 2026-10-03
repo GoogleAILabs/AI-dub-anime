@@ -35,8 +35,8 @@ import gradio as gr
 #   models/          HF / Transformers / Torch model caches
 #   separation/      Demucs outputs
 #   dialogue_cache/  per-session rendered TTS cache by default
-#   tmp/             tempfile() / FFmpeg intermediates
-#   results/         final files returned by Gradio during this session
+#   tmp/             Gradio uploads (never bulk-deleted)
+#   tmp/pipeline/    app-owned tempfile()/FFmpeg intermediates
 #
 # The pipeline is intentionally conservative about timing. Failed dialogue
 # slots block final video export instead of silently trimming words or drifting.
@@ -80,6 +80,9 @@ MODEL_CACHE = os.environ.get(
 SEPARATION_ROOT = os.path.join(SCRATCH_ROOT, "separation")
 DIALOGUE_CACHE_ROOT = os.path.join(SCRATCH_ROOT, "dialogue_cache")
 TMP_ROOT = os.path.join(SCRATCH_ROOT, "tmp")
+# IMPORTANT: Gradio uploads live directly under GRADIO_TEMP_DIR/TMP_ROOT.
+# Never clean TMP_ROOT wholesale. Our own tempfile()/FFmpeg scratch goes here.
+PIPE_TMP_ROOT = os.path.join(TMP_ROOT, "pipeline")
 RESULT_ROOT = os.path.join(SCRATCH_ROOT, "results")
 
 PERSIST_TTS_CACHE = os.environ.get("PERSIST_TTS_CACHE", "0") == "1"
@@ -93,6 +96,7 @@ for _p in [
     SEPARATION_ROOT,
     DIALOGUE_CACHE_ROOT,
     TMP_ROOT,
+    PIPE_TMP_ROOT,
     RESULT_ROOT,
 ]:
     os.makedirs(_p, exist_ok=True)
@@ -110,8 +114,11 @@ os.environ["TORCH_HOME"] = os.path.join(MODEL_CACHE, "torch")
 os.environ["XDG_CACHE_HOME"] = os.path.join(MODEL_CACHE, "xdg")
 os.environ["GRADIO_TEMP_DIR"] = TMP_ROOT
 
-# tempfile.mktemp()/NamedTemporaryFile users now land in /kaggle/tmp.
-tempfile.tempdir = TMP_ROOT
+# IMPORTANT:
+# Gradio uploaded inputs are stored under TMP_ROOT.
+# Python/FFmpeg temporary files are stored under PIPE_TMP_ROOT.
+# This separation prevents cleanup_intermediates() from deleting user uploads.
+tempfile.tempdir = PIPE_TMP_ROOT
 
 HF_TOKEN = os.environ.get("HF_TOKEN", "").strip()
 
@@ -347,14 +354,37 @@ def require_ffmpeg():
 
 
 def run_cmd(args, quiet=True, check=True):
+    """
+    Run a subprocess and preserve useful stderr.
+
+    FFmpeg often explains the real failure only in stderr. The old version
+    discarded that information and only reported "returned non-zero exit status".
+    """
     stdout = subprocess.DEVNULL if quiet else None
-    return subprocess.run(
-        args,
-        stdout=stdout,
-        stderr=subprocess.PIPE,
-        text=True,
-        check=check,
-    )
+
+    try:
+        return subprocess.run(
+            args,
+            stdout=stdout,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=check,
+            stdin=subprocess.DEVNULL,
+        )
+    except subprocess.CalledProcessError as e:
+        stderr = (e.stderr or "").strip()
+        cmd = " ".join(str(x) for x in args)
+
+        if stderr:
+            tail = stderr[-3000:]
+            raise RuntimeError(
+                f"Command failed (exit {e.returncode}):\n"
+                f"{cmd}\n\nFFmpeg/tool stderr:\n{tail}"
+            ) from e
+
+        raise RuntimeError(
+            f"Command failed (exit {e.returncode}): {cmd}"
+        ) from e
 
 
 def normalize_path(x):
@@ -386,27 +416,230 @@ def mktemp_path(suffix="", prefix="tmp_"):
     return path
 
 
+def _validate_input_file(path):
+    """Validate a Gradio/user video before giving it to FFmpeg."""
+    path = os.path.abspath(os.path.expanduser(str(path)))
+
+    if not os.path.isfile(path):
+        raise RuntimeError(
+            f"Input video file does not exist: {path}"
+        )
+
+    size = os.path.getsize(path)
+
+    if size < 1024:
+        raise RuntimeError(
+            f"Input video file is empty/too small ({size} bytes): {path}"
+        )
+
+    return path, size
+
+
+def stage_input_video(video):
+    """
+    Copy the Gradio upload to an app-owned stable scratch location.
+
+    Gradio may clean its upload directory after the request lifecycle.
+    The staged copy is controlled by this pipeline and survives the full job.
+    """
+    video, size = _validate_input_file(video)
+
+    stage_dir = os.path.join(
+        PIPE_TMP_ROOT,
+        "inputs",
+    )
+    os.makedirs(stage_dir, exist_ok=True)
+
+    digest = hashlib.sha1(
+        f"{video}|{size}|{os.path.getmtime(video):.6f}".encode(
+            "utf-8",
+            errors="ignore",
+        )
+    ).hexdigest()[:16]
+
+    ext = Path(video).suffix.lower() or ".mp4"
+    if ext not in {
+        ".mp4", ".mkv", ".avi", ".mov", ".webm",
+        ".m4v", ".ts", ".mts", ".m2ts", ".flv"
+    }:
+        ext = ".mp4"
+
+    stem = re.sub(
+        r"[^A-Za-z0-9._-]+",
+        "_",
+        Path(video).stem,
+    ).strip("._-")[:70] or "source"
+
+    staged = os.path.join(
+        stage_dir,
+        f"{stem}_{digest}{ext}",
+    )
+
+    if (
+        os.path.exists(staged)
+        and os.path.getsize(staged) == size
+    ):
+        return staged
+
+    tmp_staged = os.path.join(
+        stage_dir,
+        f".{stem}_{digest}.part{ext}",
+    )
+
+    try:
+        with open(video, "rb") as src_f, open(tmp_staged, "wb") as dst_f:
+            shutil.copyfileobj(src_f, dst_f, length=16 * 1024 * 1024)
+        os.replace(tmp_staged, staged)
+    except Exception as e:
+        try:
+            if os.path.exists(tmp_staged):
+                os.remove(tmp_staged)
+        except Exception:
+            pass
+        raise RuntimeError(
+            f"Failed to stage uploaded video into scratch storage: {e}"
+        ) from e
+
+    staged_size = os.path.getsize(staged)
+
+    if staged_size != size:
+        try:
+            os.remove(staged)
+        except Exception:
+            pass
+        raise RuntimeError(
+            f"Staged video size mismatch: source={size} bytes, "
+            f"staged={staged_size} bytes"
+        )
+
+    return staged
+
+
 def extract_audio(video):
     require_ffmpeg()
+
+    video, _ = _validate_input_file(video)
+
+    # Prefer explicit first audio stream, but allow files without audio to
+    # produce a clean error instead of an opaque FFmpeg exit code.
+    try:
+        probe = run_cmd(
+            [
+                "ffprobe",
+                "-v", "error",
+                "-select_streams", "a:0",
+                "-show_entries", "stream=index",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                video,
+            ],
+            quiet=False,
+        )
+        has_audio = bool((probe.stdout or "").strip())
+    except Exception:
+        has_audio = False
+
+    if not has_audio:
+        raise RuntimeError(
+            f"No audio stream found in source video: {video}"
+        )
+
     out = mktemp_path("_mono16k.wav", "extract_")
-    run_cmd([
-        "ffmpeg", "-y", "-i", video,
-        "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", out,
-    ])
+
+    run_cmd(
+        [
+            "ffmpeg",
+            "-y",
+            "-nostdin",
+            "-v", "error",
+            "-i", video,
+            "-map", "0:a:0",
+            "-vn",
+            "-ac", "1",
+            "-ar", "16000",
+            "-c:a", "pcm_s16le",
+            out,
+        ],
+        quiet=False,
+    )
+
+    if not os.path.exists(out) or os.path.getsize(out) < 1024:
+        raise RuntimeError(
+            f"FFmpeg created an invalid/empty extracted audio file: {out}"
+        )
+
     return out
 
 
 def prepare_video(video):
+    """
+    Stage the original upload first, then create an MP4 proxy only when needed.
+
+    We always work from the staged copy rather than directly from Gradio's
+    transient upload path.
+    """
     require_ffmpeg()
-    if Path(video).suffix.lower() == ".mp4":
-        return video
+
+    staged = stage_input_video(video)
+
+    # Probe the staged input before continuing.
+    probe = run_cmd(
+        [
+            "ffprobe",
+            "-v", "error",
+            "-show_entries", "format=format_name,duration",
+            "-of", "json",
+            staged,
+        ],
+        quiet=False,
+    )
+
+    try:
+        data = json.loads(probe.stdout or "{}")
+    except Exception as e:
+        raise RuntimeError(
+            f"Could not parse ffprobe output for staged source: {e}"
+        ) from e
+
+    duration = float(
+        (data.get("format") or {}).get("duration") or 0.0
+    )
+
+    if duration <= 0.05:
+        raise RuntimeError(
+            f"Source video has invalid/zero duration: {staged}"
+        )
+
+    # MP4 is kept when FFprobe can read it successfully.
+    if Path(staged).suffix.lower() == ".mp4":
+        return staged
+
     out = mktemp_path("_source.mp4", "proxy_")
-    run_cmd([
-        "ffmpeg", "-y", "-i", video,
-        "-map", "0:v:0", "-map", "0:a:0?",
-        "-c:v", "libx264", "-preset", "medium", "-crf", "16",
-        "-c:a", "aac", "-b:a", "320k", out,
-    ])
+
+    run_cmd(
+        [
+            "ffmpeg",
+            "-y",
+            "-nostdin",
+            "-v", "error",
+            "-i", staged,
+            "-map", "0:v:0",
+            "-map", "0:a:0?",
+            "-c:v", "libx264",
+            "-preset", "medium",
+            "-crf", "16",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac",
+            "-b:a", "320k",
+            out,
+        ],
+        quiet=False,
+    )
+
+    if not os.path.exists(out) or os.path.getsize(out) < 1024:
+        raise RuntimeError(
+            f"FFmpeg created an invalid proxy video: {out}"
+        )
+
     return out
 
 
@@ -463,22 +696,19 @@ prune_old_results()
 
 
 def cleanup_intermediates():
-    """Delete large non-persistent intermediates while keeping model/TTS caches and results."""
+    """
+    Delete only app-owned intermediate data.
+
+    NEVER delete TMP_ROOT wholesale because GRADIO_TEMP_DIR points there and
+    uploaded user files can live inside TMP_ROOT/<hash>/...
+    """
     cleanup_dir(SEPARATION_ROOT)
-    try:
-        if os.path.isdir(TMP_ROOT):
-            for item in Path(TMP_ROOT).iterdir():
-                try:
-                    if item.is_dir():
-                        shutil.rmtree(item, ignore_errors=True)
-                    else:
-                        item.unlink()
-                except Exception:
-                    pass
-    except Exception:
-        pass
+    cleanup_dir(PIPE_TMP_ROOT)
+
     os.makedirs(SEPARATION_ROOT, exist_ok=True)
-    os.makedirs(TMP_ROOT, exist_ok=True)
+    os.makedirs(PIPE_TMP_ROOT, exist_ok=True)
+
+    # Do not touch TMP_ROOT itself and do not touch Gradio upload folders.
 
 
 # ---------------------------------------------------------------
@@ -3109,6 +3339,8 @@ def full_pipeline(
         "🔒 Local inference: YES after model cache is populated",
         "💾 Persistent: /kaggle/working/anime_dub_studio",
         "⚡ Scratch: /kaggle/tmp/anime_dub_studio",
+        "📥 Gradio uploads: scratch/tmp/<gradio-folder>",
+        "🧪 Pipeline temp: scratch/tmp/pipeline",
         f"🎭 Character bank capacity: {MAX_CHARACTERS_DEFAULT}",
         f"👥 Diarization source-speaker limit: {dia_max}",
         f"🧹 Persistent TTS cache: {'ON' if PERSIST_TTS_CACHE else 'OFF'}",
@@ -3140,8 +3372,16 @@ def full_pipeline(
         cleanup_intermediates()
         prune_old_results()
         require_ffmpeg()
+
+        progress(0.015, "Staging uploaded source into scratch…")
+        staged_input = stage_input_video(video_file)
+        log.append(
+            f"✅ Source staged safely in scratch • "
+            f"{os.path.getsize(staged_input) / 1024**2:.1f} MB"
+        )
+
         progress(0.02, "Preparing source…")
-        video_mp4 = prepare_video(video_file)
+        video_mp4 = prepare_video(staged_input)
         original_audio = extract_audio(video_mp4)
         total_duration = ffprobe_duration(original_audio)
         log.append(f"✅ Source prepared • {total_duration/60:.2f} min")
